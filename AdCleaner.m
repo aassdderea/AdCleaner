@@ -2,77 +2,132 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
+static int _skipped = 0;
 static int _blocked = 0;
 
-// === 广告类名前缀（更精确） ===
-static BOOL isAdClass(NSString *cn) {
-    static NSArray *pfx = nil;
-    if (!pfx) pfx = @[
-        // 穿山甲 Pangle
-        @"BUSplashAdView", @"BUNativeExpress", @"BUFullscreen",
-        @"BURewarded", @"BUAd",
-        // 优量汇 GDT
-        @"GDTSplashAd", @"GDTUnifiedBanner", @"GDTUnifiedInterstitial",
-        @"GDTUnifiedNative", @"GDTUnifiedRewardAd",
-        // AdMob
-        @"GADBannerView", @"GADNativeAd", @"GADInterstitial",
-        @"GADRewarded", @"GADNativeExpress",
-        // 快手
-        @"KSAdSplash", @"KSNativeAd", @"KSReward",
-        // 其他
-        @"UnityAds", @"VungleAd", @"FBAdView",
-        @"SigmobSplash", @"MTGReward", @"AdColony"
-    ];
-    for (NSString *p in pfx) {
-        if ([cn hasPrefix:p] || [cn rangeOfString:p].location != NSNotFound) return YES;
+// === 在视图层级中查找包含指定文本的按钮 ===
+static UIView *findSkipButton(UIView *root) {
+    if (!root || root.hidden || root.alpha < 0.01) return nil;
+
+    NSString *text = @"";
+    if ([root isKindOfClass:[UIButton class]]) {
+        text = [(UIButton *)root titleForState:UIControlStateNormal] ?: @"";
+    } else if ([root isKindOfClass:[UILabel class]]) {
+        text = [(UILabel *)root text] ?: @"";
     }
-    return NO;
-}
-
-// === Hook: addSubview ===
-static IMP _orig_addSubview = NULL;
-static void _h_addSubview(id s, SEL c, UIView *v) {
-    if (isAdClass(NSStringFromClass([v class]))) { _blocked++; return; }
-    if (_orig_addSubview) ((void(*)(id,SEL,UIView*))_orig_addSubview)(s,c,v);
-}
-
-// === Hook: insertSubview:atIndex: ===
-static IMP _orig_insertAtIndex = NULL;
-static void _h_insertAtIndex(id s, SEL c, UIView *v, NSInteger i) {
-    if (isAdClass(NSStringFromClass([v class]))) { _blocked++; return; }
-    if (_orig_insertAtIndex) ((void(*)(id,SEL,UIView*,NSInteger))_orig_insertAtIndex)(s,c,v,i);
-}
-
-// === Hook: insertSubview:aboveSubview: ===
-static IMP _orig_insertAbove = NULL;
-static void _h_insertAbove(id s, SEL c, UIView *v, UIView *sv) {
-    if (isAdClass(NSStringFromClass([v class]))) { _blocked++; return; }
-    if (_orig_insertAbove) ((void(*)(id,SEL,UIView*,UIView*))_orig_insertAbove)(s,c,v,sv);
-}
-
-// === Hook: UIWindow.makeKeyAndVisible ===
-static IMP _orig_makeKeyAndVisible = NULL;
-static void _h_makeKeyAndVisible(id s, SEL c) {
-    // 检查是否是广告窗口
-    UIWindow *w = (UIWindow *)s;
-    id rvc = w.rootViewController;
-    NSString *vcName = rvc ? NSStringFromClass([rvc class]) : @"";
-    if (isAdClass(vcName)) {
-        _blocked++;
-        w.hidden = YES;
-        return;
+    if ([text rangeOfString:@"跳过"].location != NSNotFound ||
+        [text rangeOfString:@"Skip"].location != NSNotFound) {
+        return root;
     }
-    if (_orig_makeKeyAndVisible) ((void(*)(id,SEL))_orig_makeKeyAndVisible)(s,c);
+
+    for (UIView *sub in root.subviews) {
+        UIView *found = findSkipButton(sub);
+        if (found) return found;
+    }
+    return nil;
 }
 
-// === Hook: presentViewController ===
-static IMP _orig_presentVC = NULL;
-static void _h_presentVC(id s, SEL c, UIViewController *vc, BOOL anim, id cb) {
-    if (isAdClass(NSStringFromClass([vc class]))) { _blocked++; return; }
-    if (_orig_presentVC) ((void(*)(id,SEL,UIViewController*,BOOL,id))_orig_presentVC)(s,c,vc,anim,cb);
+// === 查找关闭/×按钮 ===
+static UIView *findCloseButton(UIView *root) {
+    if (!root || root.hidden || root.alpha < 0.01) return nil;
+
+    NSString *text = @"";
+    if ([root isKindOfClass:[UIButton class]]) {
+        text = [(UIButton *)root titleForState:UIControlStateNormal] ?: @"";
+    } else if ([root isKindOfClass:[UILabel class]]) {
+        text = [(UILabel *)root text] ?: @"";
+    }
+    if ([text isEqualToString:@"×"] ||
+        [text isEqualToString:@"✕"] ||
+        [text isEqualToString:@"关闭"] ||
+        [text rangeOfString:@"关闭"].location != NSNotFound ||
+        [text rangeOfString:@"Close"].location != NSNotFound) {
+        return root;
+    }
+
+    for (UIView *sub in root.subviews) {
+        UIView *found = findCloseButton(sub);
+        if (found) return found;
+    }
+    return nil;
 }
 
-// === Swizzle 工具 ===
+// === 模拟点击 ===
+static void tapView(UIView *view) {
+    if (!view) return;
+    if ([view isKindOfClass:[UIControl class]]) {
+        [(UIControl *)view sendActionsForControlEvents:UIControlEventTouchUpInside];
+    }
+    // 也尝试触发手势
+    for (UIGestureRecognizer *gr in view.gestureRecognizers) {
+        if ([gr isKindOfClass:[UITapGestureRecognizer class]]) {
+            // 手动设置状态触发
+            [gr touchesBegan:[NSSet set] withEvent:nil];
+            [gr touchesEnded:[NSSet set] withEvent:nil];
+        }
+    }
+    // 如果按钮在父视图中，也点父视图
+    if (view.superview && [view.superview isKindOfClass:[UIControl class]]) {
+        [(UIControl *)view.superview sendActionsForControlEvents:UIControlEventTouchUpInside];
+    }
+}
+
+// === 扫描所有窗口找跳过按钮 ===
+static void scanAllWindows(void) {
+    NSArray *windows = nil;
+    if (@available(iOS 13.0, *)) {
+        NSMutableArray *ws = [NSMutableArray array];
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) {
+                [ws addObjectsFromArray:[(UIWindowScene *)s windows]];
+            }
+        }
+        windows = ws;
+    } else {
+        windows = [UIApplication sharedApplication].windows;
+    }
+
+    for (UIWindow *w in windows) {
+        if (w.hidden || w.alpha < 0.01) continue;
+
+        // 先找"跳过"
+        UIView *skipBtn = findSkipButton(w);
+        if (skipBtn) {
+            tapView(skipBtn);
+            _skipped++;
+            return; // 一次只点一个
+        }
+
+        // 再找"关闭/×"
+        UIView *closeBtn = findCloseButton(w);
+        if (closeBtn) {
+            tapView(closeBtn);
+            _blocked++;
+            return;
+        }
+    }
+}
+
+// === Hook: UIWindow.makeKeyAndVisible（开屏广告出现时密集扫描） ===
+static IMP _orig_makeKV = NULL;
+static void _h_makeKV(id s, SEL c) {
+    if (_orig_makeKV) ((void(*)(id,SEL))_orig_makeKV)(s, c);
+
+    // 新窗口出现，密集扫描找跳过按钮
+    for (int i = 0; i < 15; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ scanAllWindows(); });
+    }
+}
+
+// === Hook: UIViewController.viewDidAppear（广告VC出现时扫描） ===
+static IMP _orig_viewDidAppear = NULL;
+static void _h_viewDidAppear(id s, SEL c, BOOL anim) {
+    if (_orig_viewDidAppear) ((void(*)(id,SEL,BOOL))_orig_viewDidAppear)(s,c,anim);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ scanAllWindows(); });
+}
+
 static void swizzle(Class cls, SEL sel, IMP newImp, IMP *store) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
@@ -81,7 +136,7 @@ static void swizzle(Class cls, SEL sel, IMP newImp, IMP *store) {
 }
 
 // === Toast ===
-static void showToast(const char *ver, int blocked) {
+static void showToast(const char *ver) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         UIWindow *kw = nil;
@@ -99,10 +154,10 @@ static void showToast(const char *ver, int blocked) {
         if (!kw) return;
 
         UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, kw.bounds.size.width, 50)];
-        lb.text = [NSString stringWithFormat:@"AdCleaner %s | %d条拦截", ver, blocked];
+        lb.text = [NSString stringWithFormat:@"AdCleaner %s | 跳过%d 关闭%d", ver, _skipped, _blocked];
         lb.textColor = [UIColor greenColor];
         lb.textAlignment = NSTextAlignmentCenter;
-        lb.font = [UIFont boldSystemFontOfSize:16];
+        lb.font = [UIFont boldSystemFontOfSize:15];
         lb.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
         [kw addSubview:lb];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
@@ -112,22 +167,16 @@ static void showToast(const char *ver, int blocked) {
 
 __attribute__((constructor))
 static void init(void) {
-    swizzle([UIView class], @selector(addSubview:), (IMP)_h_addSubview, &_orig_addSubview);
-    swizzle([UIView class], @selector(insertSubview:atIndex:), (IMP)_h_insertAtIndex, &_orig_insertAtIndex);
-    swizzle([UIView class], @selector(insertSubview:aboveSubview:), (IMP)_h_insertAbove, &_orig_insertAbove);
-    swizzle([UIWindow class], @selector(makeKeyAndVisible), (IMP)_h_makeKeyAndVisible, &_orig_makeKeyAndVisible);
-    swizzle([UIViewController class], NSSelectorFromString(@"presentViewController:animated:completion:"),
-            (IMP)_h_presentVC, &_orig_presentVC);
+    // Hook window出现 + VC出现 → 扫描跳过按钮
+    swizzle([UIWindow class], @selector(makeKeyAndVisible), (IMP)_h_makeKV, &_orig_makeKV);
+    swizzle([UIViewController class], @selector(viewDidAppear:), (IMP)_h_viewDidAppear, &_orig_viewDidAppear);
+
+    // 定时扫描（兜底）
+    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) { scanAllWindows(); }];
 
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    [@"v3 OK" writeToFile:[docs stringByAppendingPathComponent:@"adcleaner.log"]
+    [@"v4 OK" writeToFile:[docs stringByAppendingPathComponent:@"adcleaner.log"]
             atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-    showToast("v3", _blocked);
-
-    // 定时更新Toast显示拦截计数
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
-        showToast("v3", _blocked);
-    });
+    showToast("v4");
 }
